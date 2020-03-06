@@ -19,8 +19,6 @@
 #define HAVE_STRSEP
 #endif
 
-#include <log/logprint.h>
-
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -39,7 +37,7 @@
 #include <cutils/list.h>
 
 #include <log/log.h>
-#include <log/log_read.h>
+#include <log/logprint.h>
 #include <private/android_logger.h>
 
 #define MS_PER_NSEC 1000000
@@ -216,7 +214,11 @@ AndroidLogFormat* android_log_format_new() {
   p_ret->year_output = false;
   p_ret->zone_output = false;
   p_ret->epoch_output = false;
+#ifdef __ANDROID__
+  p_ret->monotonic_output = android_log_clockid() == CLOCK_MONOTONIC;
+#else
   p_ret->monotonic_output = false;
+#endif
   p_ret->uid_output = false;
   p_ret->descriptive_output = false;
   descriptive_output = false;
@@ -507,12 +509,12 @@ int android_log_processLogBuffer(struct logger_entry* buf, AndroidLogEntry* entr
    * format: <priority:1><tag:N>\0<message:N>\0
    *
    * tag str
-   *   starts at buf + buf->hdr_size + 1
+   *   starts at buf->msg+1
    * msg
-   *   starts at buf + buf->hdr_size + 1 + len(tag) + 1
+   *   starts at buf->msg+1+len(tag)+1
    *
-   * The message may have been truncated.  When that happens, we must null-terminate the message
-   * ourselves.
+   * The message may have been truncated by the kernel log driver.
+   * When that happens, we must null-terminate the message ourselves.
    */
   if (buf->len < 3) {
     /*
@@ -527,11 +529,11 @@ int android_log_processLogBuffer(struct logger_entry* buf, AndroidLogEntry* entr
   int msgEnd = -1;
 
   int i;
-  if (buf->hdr_size < sizeof(logger_entry)) {
-    fprintf(stderr, "+++ LOG: hdr_size must be at least as big as struct logger_entry\n");
+  char* msg = buf->msg;
+  if (buf->hdr_size != sizeof(struct logger_entry)) {
+    fprintf(stderr, "+++ LOG: entry illegal hdr_size\n");
     return -1;
   }
-  char* msg = reinterpret_cast<char*>(buf) + buf->hdr_size;
   entry->uid = buf->uid;
 
   for (i = 1; i < buf->len; i++) {
@@ -983,11 +985,11 @@ int android_log_processBinaryLogBuffer(
   entry->pid = buf->pid;
   entry->tid = buf->tid;
 
-  if (buf->hdr_size < sizeof(logger_entry)) {
-    fprintf(stderr, "+++ LOG: hdr_size must be at least as big as struct logger_entry\n");
+  eventData = (const unsigned char*)buf->msg;
+  if (buf->hdr_size != sizeof(struct logger_entry)) {
+    fprintf(stderr, "+++ LOG: entry illegal hdr_size\n");
     return -1;
   }
-  eventData = reinterpret_cast<unsigned char*>(buf) + buf->hdr_size;
   if (buf->lid == LOG_ID_SECURITY) {
     entry->priority = ANDROID_LOG_WARN;
   }
@@ -1046,7 +1048,7 @@ int android_log_processBinaryLogBuffer(
   }
   if ((result == 1) && fmtStr) {
     /* We overflowed :-(, let's repaint the line w/o format dressings */
-    eventData = reinterpret_cast<unsigned char*>(buf) + buf->hdr_size;
+    eventData = (const unsigned char*)buf->msg;
     eventData += 4;
     outBuf = messageBuf;
     outRemaining = messageBufLen - 1;
@@ -1461,10 +1463,13 @@ char* android_log_formatLogLine(AndroidLogFormat* p_format, char* defaultBuffer,
   nsec = entry->tv_nsec;
 #if __ANDROID__
   if (p_format->monotonic_output) {
-    struct timespec time;
-    convertMonotonic(&time, entry);
-    now = time.tv_sec;
-    nsec = time.tv_nsec;
+    /* prevent convertMonotonic from being called if logd is monotonic */
+    if (android_log_clockid() != CLOCK_MONOTONIC) {
+      struct timespec time;
+      convertMonotonic(&time, entry);
+      now = time.tv_sec;
+      nsec = time.tv_nsec;
+    }
   }
 #endif
   if (now < 0) {
